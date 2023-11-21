@@ -3,7 +3,7 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 """Model and data parallel groups."""
-
+import itertools
 import torch
 
 # Tensor model parallel group that the current rank belongs to.
@@ -14,6 +14,21 @@ _PIPELINE_MODEL_PARALLEL_GROUP = None
 # A list of global ranks for each pipeline group to ease calculation of the
 # source rank when broadcasting from the first or last pipeline stage.
 _PIPELINE_GLOBAL_RANKS = None
+
+# A dict of pair_rank: pair_process_group for senc/recv/broadcase
+_PAIR_GROUPS = None
+
+def get_global_pair_group(src_rank, dst_rank):
+    if get_pipeline_model_parallel_world_size() == 1 and get_tensor_model_parallel_world_size() == 1:
+        raise ValueError(f"parallel is not available")
+    key1 = (src_rank, dst_rank)
+    key2 = (dst_rank, src_rank)
+    found1 = key1 in _PAIR_GROUPS
+    found2 = key2 in _PAIR_GROUPS
+    assert found1 or found2, f"can not find pair group of rank ({src_rank}, {dst_rank})"
+    if found1:
+        return _PAIR_GROUPS[key1]
+    return _PAIR_GROUPS[key2]
 
 
 def initialize_model_parallel(
@@ -82,6 +97,15 @@ def initialize_model_parallel(
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
 
+    global _PAIR_GROUPS
+    assert _PAIR_GROUPS is None, ("pair groups are already initialized")
+
+    pair_groups = {}
+    backend = torch.distributed.get_backend(torch.distributed.group.WORLD)
+    for pair in itertools.combinations(list(range(world_size)), 2):
+        group = torch.distributed.new_group(pair, backend=backend)
+        pair_groups[(pair[0], pair[1])] = group
+    _PAIR_GROUPS = pair_groups
 
 def model_parallel_is_initialized():
     """Check if model and data parallel groups are initialized."""
@@ -114,6 +138,10 @@ def get_pipeline_model_parallel_world_size():
     return torch.distributed.get_world_size(
         group=get_pipeline_model_parallel_group())
 
+
+def get_gloabl_rank():
+    """Return my global rank for the WORLD group."""
+    return torch.distributed.get_rank()
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
@@ -177,3 +205,11 @@ def destroy_model_parallel():
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = None
+    global _PAIR_GROUPS
+    _PAIR_GROUPS = None
+
+def is_pipeline_model_parallel_first_rank():
+    return get_gloabl_rank() == get_pipeline_model_parallel_first_rank()
+
+def is_pipeline_model_parallel_last_rank():
+    return get_gloabl_rank() == get_pipeline_model_parallel_last_rank()

@@ -16,6 +16,20 @@ from vllm.worker.cache_engine import CacheEngine
 from vllm.utils import get_gpu_memory
 
 
+
+from vllm.model_executor.parallel_utils.parallel_state import (
+    is_pipeline_model_parallel_first_rank,
+    is_pipeline_model_parallel_last_rank,
+    get_pipeline_model_parallel_rank
+
+)
+from vllm.model_executor.parallel_utils.communication_op import (
+    pipeline_model_parallel_send_tensor_list,
+    pipeline_model_parallel_recv_tensor_list,
+    barrier
+)
+
+
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
 
@@ -68,8 +82,11 @@ class Worker:
         # Initialize the model.
         set_random_seed(self.model_config.seed)
 
+        # Partition pipeline model layers
+        _partition_pipeline_model(self.model_config, self.parallel_config)
+
     def load_model(self):
-        self.model = get_model(self.model_config)
+        self.model = get_model(self.model_config, self.parallel_config)
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -110,14 +127,27 @@ class Worker:
 
         # Execute the model.
         num_layers = self.model_config.get_num_layers(self.parallel_config)
-        self.model(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=[(None, None)] * num_layers,
-            input_metadata=input_metadata,
-            cache_events=None,
-        )
-
+        if is_pipeline_model_parallel_first_rank():
+            self.model(
+                input_ids=input_tokens,
+                positions=input_positions,
+                kv_caches=[(None, None)] * num_layers,
+                input_metadata=input_metadata,
+                cache_events=None,
+            )
+        else:
+            hidden_states_shape = (*input_tokens.shape,
+                                   self.model_config.get_hidden_size())
+            hidden_states = torch.ones(*hidden_states_shape,
+                                       dtype=self.model_config.dtype,
+                                       device=input_tokens.device)
+            self.model(
+                input_ids=hidden_states,
+                positions=input_positions,
+                kv_caches=[(None, None)] * num_layers,
+                input_metadata=input_metadata,
+                cache_events=None,
+            )
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         torch.cuda.synchronize()
@@ -366,14 +396,34 @@ class Worker:
             seq_group_metadata_list)
 
         # Execute the model.
-        output = self.model(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=self.gpu_cache,
-            input_metadata=input_metadata,
-            cache_events=cache_events,
-        )
-        return output
+        if is_pipeline_model_parallel_first_rank():       
+            output = self.model(
+                input_ids=input_tokens,
+                positions=input_positions,
+                kv_caches=self.gpu_cache,
+                input_metadata=input_metadata,
+                cache_events=cache_events,
+            )
+        else:
+            output = pipeline_model_parallel_recv_tensor_list()
+            hidden_states = output[0]
+            residual = output[1]
+            output = self.model(
+                input_ids=hidden_states,
+                positions=input_positions,
+                kv_caches=self.gpu_cache,
+                input_metadata=input_metadata,
+                cache_events=cache_events,
+                residual=residual
+            )
+        if not is_pipeline_model_parallel_last_rank():
+            pipeline_model_parallel_send_tensor_list(list(output))
+
+        barrier(ignore_pure_tp=True)
+        
+        if is_pipeline_model_parallel_last_rank():
+            return output
+        return None
 
 
 def _init_distributed_environment(
@@ -405,6 +455,36 @@ def _init_distributed_environment(
     torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
                               parallel_config.pipeline_parallel_size)
+
+def _partition_pipeline_model(model_config: ModelConfig, 
+                              parallel_config: ParallelConfig,
+                              centered: bool = True):
+        num_layers = model_config.hf_config.num_hidden_layers
+        pp_size = parallel_config.pipeline_parallel_size
+        assert num_layers >= pp_size
+        partition_info = dict()
+        layer_per_stage = [num_layers // pp_size] * pp_size
+
+        rest = num_layers % pp_size
+        for i in range(rest):
+            idx = -(i + 2) if centered else -(i + 1)
+            layer_per_stage[idx] = layer_per_stage[idx] + 1
+        
+        start = 0
+        for pp_rank in range(pp_size):
+            layer = layer_per_stage[pp_rank]
+            partition_info[pp_rank] = (start, min(start + layer - 1, num_layers - 1))
+            start += layer
+        
+        start, end = partition_info[get_pipeline_model_parallel_rank()]
+    
+
+        parallel_config.start = start
+        parallel_config.end = end
+        parallel_config.is_first = start == 0
+        parallel_config.is_last = end == num_layers - 1
+
+        model_config
 
 
 def _pad_to_alignment(x: List[int], multiple_of: int, pad: int) -> List[int]:

@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from vllm.config import ParallelConfig
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttentionWithRoPE
@@ -226,21 +227,26 @@ class LlamaModel(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        parallel_config: ParallelConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
+        self.parallel_config = parallel_config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if self.parallel_config.is_first:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        self.layers = nn.ModuleList()
+        for i in range(self.parallel_config.start, self.parallel_config.end + 1):
+            self.layers.add_module(f"{i}", LlamaDecoderLayer(config, linear_method))
+        
+        if self.parallel_config.is_last:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -249,12 +255,14 @@ class LlamaModel(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
+        residual: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
-        for i in range(len(self.layers)):
+        if self.parallel_config.is_first:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_ids
+        for i, layer in enumerate(self.layers):
             cache_event = None if cache_events is None else cache_events[i]
-            layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -263,8 +271,9 @@ class LlamaModel(nn.Module):
                 cache_event,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if self.parallel_config.is_last:
+            hidden_states, residual = self.norm(hidden_states, residual)
+        return hidden_states, residual
 
 
 class LlamaForCausalLM(nn.Module):
@@ -272,14 +281,17 @@ class LlamaForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        parallel_config: ParallelConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
+        self.parallel_config = parallel_config
         self.linear_method = linear_method
-        self.model = LlamaModel(config, linear_method)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        self.sampler = Sampler(config.vocab_size)
+        self.model = LlamaModel(config, parallel_config, linear_method)
+        if self.parallel_config.is_last:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+            self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
@@ -288,12 +300,16 @@ class LlamaForCausalLM(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
+        residual: Optional[torch.Tensor] = None,
     ) -> SamplerOutput:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata, cache_events)
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   input_metadata)
-        return next_tokens
+        hidden_states, residual = self.model(input_ids, positions, kv_caches,
+                                   input_metadata, cache_events, residual)
+        if self.parallel_config.is_last:
+            next_tokens = self.sampler(self.lm_head.weight, hidden_states,
+                                    input_metadata)
+            return next_tokens
+        else:
+            return hidden_states, residual
 
     def load_weights(self,
                      model_name_or_path: str,
@@ -316,11 +332,15 @@ class LlamaForCausalLM(nn.Module):
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                if name.replace(weight_name, param_name) not in params_dict:
+                    continue
                 param = params_dict[name.replace(weight_name, param_name)]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

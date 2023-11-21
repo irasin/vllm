@@ -228,7 +228,7 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         # Initialize the cache.
-        self._run_workers("init_cache_engine", cache_config=self.cache_config)
+        self._run_workers("init_cache_engine", cache_config=self.cache_config, get_all_outputs=True)
 
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMEngine":
@@ -738,6 +738,7 @@ class LLMEngine:
 
         if get_all_outputs:
             return all_outputs
+        all_outputs = [i for i in all_outputs if i is not None]
 
         # Make sure all workers have the same results.
         output = all_outputs[0]

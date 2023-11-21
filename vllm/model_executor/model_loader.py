@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models import *
 from vllm.model_executor.weight_utils import (get_quant_config,
                                               initialize_dummy_weights)
@@ -38,6 +38,10 @@ _MODEL_REGISTRY = {
     "YiForCausalLM": YiForCausalLM,
 }
 
+# FIXME: Remove this once all models support pipeline parallel.
+_MODEL_CLASSES_SUPPORT_PIPELINE_PARALLEL = [
+    LlamaForCausalLM,
+]
 
 @contextlib.contextmanager
 def _set_default_torch_dtype(dtype: torch.dtype):
@@ -58,8 +62,12 @@ def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
         f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
 
 
-def get_model(model_config: ModelConfig) -> nn.Module:
+def get_model(model_config: ModelConfig, parallel_config: ParallelConfig,) -> nn.Module:
     model_class = _get_model_architecture(model_config.hf_config)
+
+    if parallel_config.pipeline_parallel_size > 1 and model_class not in _MODEL_CLASSES_SUPPORT_PIPELINE_PARALLEL:
+        raise ValueError(f"Pipeline parallel is not supported for {model_class}.") 
+
 
     # Get the (maybe quantized) linear method.
     linear_method = None
@@ -87,7 +95,10 @@ def get_model(model_config: ModelConfig) -> nn.Module:
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
-        model = model_class(model_config.hf_config, linear_method)
+        if model_class in _MODEL_CLASSES_SUPPORT_PIPELINE_PARALLEL:
+            model = model_class(model_config.hf_config, parallel_config, linear_method)
+        else:
+            model = model_class(model_config.hf_config, linear_method)
         if model_config.load_format == "dummy":
             model = model.cuda()
             # NOTE(woosuk): For accurate performance evaluation, we assign
